@@ -21,7 +21,7 @@ with lib;
     url = mkOption {
       default = "";
       type = types.str;
-      description = "SAAS url used for token generation, Nixops will pass the account token in the header and the deployment name as a query param name 'username'";
+      description = "SAAS url that Nixops is going to use to generate the user token from the account token, Nixops will pass the account token in the header and the deployment name as a query param name 'username'";
     };
 
     account_token_path = mkOption {
@@ -33,7 +33,7 @@ with lib;
     token = mkOption {
       default = "";
       type = types.str;
-      description = "token";
+      description = "The user token, Nixops will get it from the saas url";
     };
 
   };
