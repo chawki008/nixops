@@ -70,6 +70,7 @@ class saasAuthstate(nixops.resources.ResourceState):
         r = requests.get('{}?username={}'.format(
             defn.url, defn.deployment_name), headers=headers)
         self.token = r.content
+        self.state = self.UP
         return
 
     def destroy(self, wipe=False):
