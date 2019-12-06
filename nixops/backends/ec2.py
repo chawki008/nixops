@@ -44,6 +44,7 @@ class EC2Definition(MachineDefinition):
         self.access_key_id = config["ec2"]["accessKeyId"]
         self.region = config["ec2"]["region"]
         self.zone = config["ec2"]["zone"]
+        self.tenancy = config["ec2"]["tenancy"]
         self.ami = config["ec2"]["ami"]
         if self.ami == "":
             raise Exception("no AMI defined for EC2 machine ‘{0}’".format(self.name))
@@ -57,10 +58,13 @@ class EC2Definition(MachineDefinition):
         self.root_disk_size = config["ec2"]["ebsInitialRootDiskSize"]
         self.spot_instance_price = config["ec2"]["spotInstancePrice"]
         self.spot_instance_timeout = config["ec2"]["spotInstanceTimeout"]
+        self.spot_instance_request_type = config["ec2"]["spotInstanceRequestType"]
+        self.spot_instance_interruption_behavior = config["ec2"]["spotInstanceInterruptionBehavior"]
         self.ebs_optimized = config["ec2"]["ebsOptimized"]
         self.subnet_id = config["ec2"]["subnetId"]
         self.associate_public_ip_address = config["ec2"]["associatePublicIpAddress"]
         self.use_private_ip_address = config["ec2"]["usePrivateIpAddress"]
+        self.source_dest_check = config["ec2"]["sourceDestCheck"]
         self.security_group_ids = config["ec2"]["securityGroupIds"]
 
         # convert sd to xvd because they are equal from aws perspective
@@ -72,6 +76,7 @@ class EC2Definition(MachineDefinition):
         self.dns_ttl = config["route53"]["ttl"]
         self.route53_access_key_id = config["route53"]["accessKeyId"]
         self.route53_use_public_dns_name = config["route53"]["usePublicDNSName"]
+        self.route53_private = config["route53"]["private"]
 
     def show_type(self):
         return "{0} [{1}]".format(self.get_type(), self.region or self.zone or "???")
@@ -95,11 +100,13 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
     private_ipv4 = nixops.util.attr_property("privateIpv4", None)
     public_dns_name = nixops.util.attr_property("publicDnsName", None)
     use_private_ip_address = nixops.util.attr_property("ec2.usePrivateIpAddress", False, type=bool)
+    source_dest_check = nixops.util.attr_property("ec2.sourceDestCheck", True, type=bool)
     associate_public_ip_address = nixops.util.attr_property("ec2.associatePublicIpAddress", False, type=bool)
     elastic_ipv4 = nixops.util.attr_property("ec2.elasticIpv4", None)
     access_key_id = nixops.util.attr_property("ec2.accessKeyId", None)
     region = nixops.util.attr_property("ec2.region", None)
     zone = nixops.util.attr_property("ec2.zone", None)
+    tenancy = nixops.util.attr_property("ec2.tenancy", None)
     ami = nixops.util.attr_property("ec2.ami", None)
     instance_type = nixops.util.attr_property("ec2.instanceType", None)
     ebs_optimized = nixops.util.attr_property("ec2.ebsOptimized", None, bool)
@@ -138,6 +145,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
             self.state = MachineState.MISSING
             self.associate_public_ip_address = None
             self.use_private_ip_address = None
+            self.source_dest_check = None
             self.vm_id = None
             self.public_ipv4 = None
             self.private_ipv4 = None
@@ -145,6 +153,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
             self.elastic_ipv4 = None
             self.region = None
             self.zone = None
+            self.tenancy = None
             self.ami = None
             self.instance_type = None
             self.ebs_optimized = None
@@ -554,6 +563,8 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         device_real = device_name_stored_to_real(device_stored)
 
         volume = nixops.ec2_utils.get_volume_by_id(self.connect(), volume_id)
+        if not volume:
+            raise Exception("volume {0} doesn't exist, run check to update the state of the volume".format(volume_id))
         if volume.status == "in-use" and \
             self.vm_id != volume.attach_data.instance_id and \
             self.depl.logger.confirm("volume ‘{0}’ is in use by instance ‘{1}’, "
@@ -679,97 +690,103 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
 
         return groups
 
-    def _get_network_interfaces(self, defn):
-        groups = self.security_groups_to_ids(defn.subnet_id, defn.security_group_ids)
+    def _wait_for_spot_request_fulfillment(self, request_id):
 
-        return boto.ec2.networkinterface.NetworkInterfaceCollection(
-            boto.ec2.networkinterface.NetworkInterfaceSpecification(
-                subnet_id=defn.subnet_id,
-                associate_public_ip_address=defn.associate_public_ip_address,
-                groups=groups
-            )
-        )
+        self.log_start("waiting for spot instance request ‘{0}’ to be fulfilled... ".format(self.spot_instance_request_id))
+        while True:
+            request = self._get_spot_instance_request_by_id(self.spot_instance_request_id)
+            self.log_continue("[{0}] ".format(request.status.code))
+            if request.status.code == "fulfilled": break
+            if request.status.code in {"schedule-expired", "canceled-before-fulfillment", "bad-parameters", "system-error"}:
+                self.spot_instance_request_id = None
+                self.log_end("")
+                raise Exception("spot instance request failed with result ‘{0}’".format(request.status.code))
+            time.sleep(3)
+        self.log_end("")
+
+        instance = self._retry(lambda: self._get_instance(instance_id=request.instance_id))
+
+        return instance
 
 
-    def create_instance(self, defn, zone, devmap, user_data, ebs_optimized):
-        common_args = dict(
-            instance_type=defn.instance_type,
-            placement=zone,
-            key_name=defn.key_pair,
-            placement_group=defn.placement_group,
-            block_device_map=devmap,
-            user_data=user_data,
-            image_id=defn.ami,
-            ebs_optimized=ebs_optimized
-        )
-
+    def create_instance(self, defn, zone, user_data, ebs_optimized, args):
+        IamInstanceProfile = {}
         if defn.instance_profile.startswith("arn:") :
-            common_args['instance_profile_arn'] = defn.instance_profile
+            IamInstanceProfile["Arn"] = defn.instance_profile
         else:
-            common_args['instance_profile_name'] = defn.instance_profile
+            IamInstanceProfile["Name"] = defn.instance_profile
 
         if defn.subnet_id != "":
             if defn.security_groups != [] and defn.security_groups != ["default"]:
                 raise Exception("‘deployment.ec2.securityGroups’ is incompatible with ‘deployment.ec2.subnetId’")
-            common_args['network_interfaces'] = self._get_network_interfaces(defn)
+
+            args['NetworkInterfaces'] = [dict(
+                AssociatePublicIpAddress=defn.associate_public_ip_address,
+                SubnetId=defn.subnet_id,
+                DeviceIndex=0,
+                Groups=self.security_groups_to_ids(defn.subnet_id, defn.security_group_ids)
+            )]
         else:
-            common_args['security_groups'] = defn.security_groups
+            args['SecurityGroups'] = defn.security_groups
 
         if defn.spot_instance_price:
-            if self.spot_instance_request_id is None:
+            args["InstanceMarketOptions"] = dict(
+                MarketType="spot",
+                SpotOptions=dict(
+                    MaxPrice=str(defn.spot_instance_price/100.0),
+                    SpotInstanceType=defn.spot_instance_request_type,
+                    InstanceInterruptionBehavior=defn.spot_instance_interruption_behavior
+                )
+            )
+            if defn.spot_instance_timeout:
+                args["InstanceMarketOptions"]["SpotOptions"]["ValidUntil"]=(datetime.datetime.utcnow() +
+                    datetime.timedelta(0, defn.spot_instance_timeout)).isoformat()
 
-                if defn.spot_instance_timeout:
-                    common_args['valid_until'] = \
-                        (datetime.datetime.utcnow() +
-                         datetime.timedelta(0, defn.spot_instance_timeout)).isoformat()
+        placement = dict(
+            AvailabilityZone=zone or ""
+        )
+        if defn.tenancy:
+            placement['Tenancy'] = defn.tenancy
 
-                # FIXME: Should use a client token here, but
-                # request_spot_instances doesn't support one.
-                request = self._retry(
-                    lambda: self._conn.request_spot_instances(price=defn.spot_instance_price/100.0, **common_args)
-                )[0]
+        args['InstanceType'] = defn.instance_type
+        args['ImageId'] = defn.ami
+        args['IamInstanceProfile'] = IamInstanceProfile
+        args['KeyName'] = defn.key_pair
+        args['Placement'] = placement
+        args['UserData'] = user_data
+        args['EbsOptimized'] = ebs_optimized
+        args['MaxCount'] = 1 # We always want to deploy one instance.
+        args['MinCount'] = 1
 
-                with self.depl._db:
-                    self.spot_instance_price = defn.spot_instance_price
-                    self.spot_instance_request_id = request.id
+        # Use a client token to ensure that instance creation is
+        # idempotent; i.e., if we get interrupted before recording
+        # the instance ID, we'll get the same instance ID on the
+        # next run.
+        if not self.client_token:
+            with self.depl._db:
+                self.client_token = nixops.util.generate_random_string(length=48) # = 64 ASCII chars
+                self.state = self.STARTING
 
-            common_tags = self.get_common_tags()
-            tags = {'Name': "{0} [{1}]".format(self.depl.description, self.name)}
-            tags.update(defn.tags)
-            tags.update(common_tags)
-            self._retry(lambda: self._conn.create_tags([self.spot_instance_request_id], tags))
+        args["ClientToken"] = self.client_token
 
-            self.log_start("waiting for spot instance request ‘{0}’ to be fulfilled... ".format(self.spot_instance_request_id))
-            while True:
-                request = self._get_spot_instance_request_by_id(self.spot_instance_request_id)
-                self.log_continue("[{0}] ".format(request.status.code))
-                if request.status.code == "fulfilled": break
-                if request.status.code in {"schedule-expired", "canceled-before-fulfillment", "bad-parameters", "system-error"}:
-                    self.spot_instance_request_id = None
-                    self.log_end("")
-                    raise Exception("spot instance request failed with result ‘{0}’".format(request.status.code))
-                time.sleep(3)
-            self.log_end("")
+        reservation = self._retry(
+            lambda: self._conn_boto3.run_instances(**args)
+        )
 
-            instance = self._retry(lambda: self._get_instance(instance_id=request.instance_id))
+        if not defn.spot_instance_price:
+            # On demand instance, no need to any more checks, return it.
+            return self._get_instance(reservation["Instances"][0]["InstanceId"])
 
-            return instance
-        else:
-            # Use a client token to ensure that instance creation is
-            # idempotent; i.e., if we get interrupted before recording
-            # the instance ID, we'll get the same instance ID on the
-            # next run.
-            if not self.client_token:
-                with self.depl._db:
-                    self.client_token = nixops.util.generate_random_string(length=48) # = 64 ASCII chars
-                    self.state = self.STARTING
+        with self.depl._db:
+            self.spot_instance_price = defn.spot_instance_price
+            self.spot_instance_request_id = reservation["Instances"][0]["SpotInstanceRequestId"]
 
-            reservation = self._retry(lambda: self._conn.run_instances(
-                client_token=self.client_token, **common_args), error_codes = ['InvalidParameterValue', 'UnauthorizedOperation' ])
+        tags = {'Name': "{0} [{1}]".format(self.depl.description, self.name)}
+        tags.update(defn.tags)
+        tags.update(self.get_common_tags())
+        self._retry(lambda: self._conn.create_tags([self.spot_instance_request_id], tags))
 
-            assert len(reservation.instances) == 1
-            return reservation.instances[0]
-
+        return self._wait_for_spot_request_fulfillment(self.spot_instance_request_id)
 
     def _cancel_spot_request(self):
         if self.spot_instance_request_id is None: return
@@ -916,23 +933,24 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 self.connect()
 
             # Figure out whether this AMI is EBS-backed.
-            amis = self._conn.get_all_images([defn.ami])
+            amis = self._conn_boto3.describe_images(ImageIds=[defn.ami])
             if len(amis) == 0:
                 raise Exception("AMI ‘{0}’ does not exist in region ‘{1}’".format(defn.ami, self.region))
-            ami = self._conn.get_all_images([defn.ami])[0]
-            self.root_device_type = ami.root_device_type
+            ami = self._conn_boto3.describe_images(ImageIds=[defn.ami])['Images'][0]
+            self.root_device_type = ami['RootDeviceType']
 
             # Check if we need to resize the root disk
-            resize_root = defn.root_disk_size != 0 and ami.root_device_type == 'ebs'
+            resize_root = defn.root_disk_size != 0 and ami['RootDeviceType'] == 'ebs'
+
+            args = dict()
 
             # Set the initial block device mapping to the ephemeral
             # devices defined in the spec.  These cannot be changed
             # later.
-            devmap = boto.ec2.blockdevicemapping.BlockDeviceMapping()
+            args['BlockDeviceMappings'] = []
 
             for device_stored, v in defn.block_device_mapping.iteritems():
                 device_real = device_name_stored_to_real(device_stored)
-
                 # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
                 ebs_disk = not v['disk'].startswith("ephemeral")
 
@@ -943,15 +961,24 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                     raise Exception("non-ephemeral disk not allowed on device ‘{0}’; use /dev/xvdf or higher".format(device_real))
 
                 if v['disk'].startswith("ephemeral"):
-                    devmap[device_stored] = boto.ec2.blockdevicemapping.BlockDeviceType(ephemeral_name=v['disk'])
+                    ephemeral_mapping = dict(
+                        DeviceName=device_name_to_boto_expected(device_real),
+                        VirtualName=v['disk']
+                    )
+                    args['BlockDeviceMappings'].append(ephemeral_mapping)
                     self.update_block_device_mapping(device_stored, v)
 
-            root_device = ami.root_device_name
+            root_device = ami['RootDeviceName']
             if resize_root:
-                devmap[root_device] = ami.block_device_mapping[root_device]
-                devmap[root_device].size = defn.root_disk_size
-                devmap[root_device].encrypted = None
-
+                root_mapping = dict(
+                    DeviceName=root_device,
+                    Ebs=dict(
+                        DeleteOnTermination=True,
+                        VolumeSize=defn.root_disk_size,
+                        VolumeType=ami['BlockDeviceMappings'][0]['Ebs']['VolumeType']
+                    )
+                )
+                args['BlockDeviceMappings'].append(root_mapping)
             # If we're attaching any EBS volumes, then make sure that
             # we create the instance in the right placement zone.
             zone = defn.zone or None
@@ -975,7 +1002,6 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
 
             # if we have PIOPS volume and instance type supports EBS Optimized flags, then use ebs_optimized
             ebs_optimized = prefer_ebs_optimized and defn.ebs_optimized
-
             # Generate a public/private host key.
             if not self.public_host_key:
                 (private, public) = nixops.util.create_key_pair(type=defn.host_key_type())
@@ -987,7 +1013,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 self.public_host_key, self.private_host_key.replace("\n", "|"),
                 defn.host_key_type().upper())
 
-            instance = self.create_instance(defn, zone, devmap, user_data, ebs_optimized)
+            instance = self.create_instance(defn, zone, user_data, ebs_optimized, args)
             update_instance_profile = False
 
             with self.depl._db:
@@ -999,13 +1025,15 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 self.security_groups = defn.security_groups
                 self.placement_group = defn.placement_group
                 self.zone = instance.placement
+                self.tenancy = defn.tenancy
                 self.instance_profile = defn.instance_profile
                 self.client_token = None
                 self.private_host_key = None
 
             # Cancel spot instance request, it isn't needed after the
-            # instance has been provisioned.
-            self._cancel_spot_request()
+            # instance has been provisioned in case of "one-time" requests
+            if defn.spot_instance_request_type == "one-time":
+                self._cancel_spot_request()
 
 
         # There is a short time window during which EC2 doesn't
@@ -1078,6 +1106,11 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
             common_tags['Owners'] = ", ".join(defn.owners)
         self.update_tags(self.vm_id, user_tags=common_tags, check=check)
 
+        # Reapply sourceDestCheck if it has changed.
+        if self.source_dest_check != defn.source_dest_check:
+            instance.modify_attribute("sourceDestCheck", defn.source_dest_check)
+            self.source_dest_check = defn.source_dest_check
+
         # Assign the elastic IP.  If necessary, dereference the resource.
         elastic_ipv4 = defn.elastic_ipv4
         if elastic_ipv4.startswith("res-"):
@@ -1127,7 +1160,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         # Detect if volumes were manually detached.  If so, reattach
         # them.
         for device_stored, v in self.block_device_mapping.items():
-            if device_stored not in self._get_instance().block_device_mapping.keys() and not v.get('needsAttach', False) and v.get('volumeId', None):
+            if device_name_to_boto_expected(device_stored) not in self._get_instance().block_device_mapping.keys() and not v.get('needsAttach', False) and v.get('volumeId', None):
                 device_real = device_name_stored_to_real(device_stored)
                 self.warn("device ‘{0}’ was manually detached!".format(device_real))
                 v['needsAttach'] = True
@@ -1251,8 +1284,21 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         self.dns_ttl = defn.dns_ttl
         self.route53_access_key_id = defn.route53_access_key_id or nixops.ec2_utils.get_access_key_id()
         self.route53_use_public_dns_name = defn.route53_use_public_dns_name
-        record_type = 'CNAME' if self.route53_use_public_dns_name else 'A'
-        dns_value = self.public_dns_name if self.route53_use_public_dns_name else self.public_ipv4
+        self.route53_private = defn.route53_private
+
+        if self.route53_private:
+            if self.route53_use_public_dns_name:
+                raise Exception("Can not add record for ‘{0}’, because private CNAME records are not implemented in NixOps. You may choose to use an ‘A’ record instead by setting ‘usePublicDNSName = false’.".format(self.dns_hostname))
+
+            record_type = 'A'
+            dns_value = self.private_ipv4
+
+        else:
+            if not self.public_ipv4:
+                raise Exception("No public ipv4 address has been associated with ‘{0}’. If this record is intended for a public cloud host, make sure it is defined and its public IP address is known to NixOps. If this is record is intended for a private cloud, use ‘private = true’ to use the private IP adress instead.".format(self.dns_hostname))
+
+            record_type = 'CNAME' if self.route53_use_public_dns_name else 'A'
+            dns_value = self.public_dns_name if self.route53_use_public_dns_name else self.public_ipv4
 
         self.log('sending Route53 DNS: {0} {1} {2}'.format(self.dns_hostname, record_type, dns_value))
 
